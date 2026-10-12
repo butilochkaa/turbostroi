@@ -1,0 +1,527 @@
+#include "gmsv_turbostroi.h"
+
+#include <thread>
+#include <vector>
+#include <queue>
+#include <GarrysMod/Lua/Interface.h>
+#include <GarrysMod/Lua/LuaInterface.h>
+#include <convar.h>
+#include <basehandle.h>
+#include <globalvars_base.h>
+#include <dbg.h>
+#include <color.h>
+#include "affinity.h"
+#include "filesystem_gmod.h"
+#include "source_sdk.h"
+#include "shared_print.h"
+#include "wagon.h"
+
+namespace GM = GarrysMod::Lua;
+
+#define PushCFunc(_function,_name) LUA->PushCFunction(_function); LUA->SetField(-2, _name)
+
+//------------------------------------------------------------------------------
+// глобальные переменные модуля
+//------------------------------------------------------------------------------
+std::string g_LibraryFileName;
+bool g_ForceThreadsFinished = false; // флаг для мягкой остановки всех потоков при смене карты
+std::atomic<double> g_CurrentTime = 0.0;
+unsigned int g_ThreadTickrate = 10000; // задержка тика в микросекундах (10мс = 100 fps)
+std::vector<TTrainSystem> g_MetrostroiSystemList;
+std::queue<TTrainSystem> g_LoadSystemList;
+std::unordered_map<std::string, std::string> g_LoadedFilesCache;
+
+//------------------------------------------------------------------------------
+// интерфейсы движка source sdk
+//------------------------------------------------------------------------------
+extern ICvar* cvar;
+extern ICvar* g_pCVar;
+extern CGlobalVarsBase* g_pServerGlobalVars;
+extern ConVar g_CVarDisableCache;
+
+//------------------------------------------------------------------------------
+// вызов lua-хуков жизненного цикла вагона в gmod
+//------------------------------------------------------------------------------
+void HookRunTrainEnt(GarrysMod::Lua::ILuaBase* LUA, int entStackPos, bool remove = false);
+
+//------------------------------------------------------------------------------
+// загрузка файлов систем метростроя
+//------------------------------------------------------------------------------
+bool LoadSystem(GM::ILuaBase* LUA, CWagon* userdata, const char* filename)
+{
+	// проверяем кэш в памяти, чтобы не читать диск повторно
+	bool useCache = !g_CVarDisableCache.GetBool();
+	if (useCache)
+	{
+		const auto& cache_item = g_LoadedFilesCache.find(filename);
+		if (cache_item != g_LoadedFilesCache.end())
+		{
+			const std::string& data = cache_item->second;
+			return userdata->LoadBuffer(data.c_str(), data.size(), filename);
+		}
+	}
+
+	// читаем файл через файловую систему gmod (серверные скрипты с префиксом lsv)
+	const char* data = GMOD_FileRead(LUA, filename, "lsv");
+	if (data == nullptr)
+	{
+		ConColorMsg(Color(255, 0, 127, 255), "Turbostroi: File not found! ('%s')\n", filename);
+		return false;
+	}
+
+	// загружаем скрипт в виртуальную машину вагона
+	bool loaded = userdata->LoadBuffer(data, strlen(data), filename);
+	if (useCache && loaded) g_LoadedFilesCache.emplace(filename, data);
+
+	return loaded;
+}
+
+// достаем entindex из userdata энтити gmod
+inline unsigned int GetEntIndex(GM::ILuaBase* LUA, int iStackPos)
+{	
+	if (!LUA->IsType(iStackPos, GM::Type::Entity))
+		return 0;
+
+	auto* ud = reinterpret_cast<GM::ILuaBase::UserData*>(LUA->GetUserdata(iStackPos));
+	CBaseHandle eh(ud ? *reinterpret_cast<unsigned int*>(ud->data) : 0);
+	return eh.GetEntryIndex();
+}
+
+// инициализация симуляции вагона: создание потока, луа-стэйта и загрузка систем
+LUA_FUNCTION( API_InitializeTrain ) 
+{
+	unsigned int idx = GetEntIndex(LUA, 1);
+	CWagon* userdata = CWagon::Create(idx);
+	if (userdata == nullptr)
+	{
+		if (idx > 0)
+		{
+			// если не получилось создать вагон — отключаем симуляцию в турбострое
+			LUA->PushBool(true);
+			LUA->SetField(1, "DontAccelerateSimulation");
+		}
+
+		ConColorMsg(Color(255, 0, 255, 255), "Turbostroi: Fail to create CWagon!\n");
+		return 0;
+	}
+
+	// если кэш отключен разработчиком — очищаем его
+	if (g_CVarDisableCache.GetBool())
+		g_LoadedFilesCache.clear();
+
+	// грузим базовую библиотеку turbostroi v2
+	if (!LoadSystem(LUA, userdata, "metrostroi/lib_turbostroi_v2.lua") || !userdata->CheckLibLoaded())
+	{
+		ConColorMsg(Color(255, 0, 255, 255), "[!] Fail to load lib_turbostroi_v2.lua\n");
+
+		LUA->PushBool(true);
+		LUA->SetField(1, "DontAccelerateSimulation");
+
+		delete userdata;
+		HookRunTrainEnt(LUA, 1);
+		return 0;
+	}
+
+	// загружаем общие системы и зарегистрированные скрипты поезда
+	LoadSystem(LUA, userdata, "metrostroi/sh_failsim.lua");
+	for (const TTrainSystem& sys : g_MetrostroiSystemList)
+	{
+		LoadSystem(LUA, userdata, sys.file_name.c_str());
+	}
+
+	// регистрируем системы для текущего вагона
+	while (!g_LoadSystemList.empty())
+	{
+		userdata->AddLoadSystem(g_LoadSystemList.front());
+		g_LoadSystemList.pop();
+	}
+
+	HookRunTrainEnt(LUA, 1);
+
+	// стартуем отдельный системный поток симуляции вагона
+	std::thread thread(&CWagon::SimulationThreadFn, userdata);
+	thread.detach();
+
+	return 0;
+}
+
+// остановка симуляции и уничтожение вагона при удалении энтити
+LUA_FUNCTION( API_DeinitializeTrain ) 
+{
+	CWagon* userdata = CWagon::CWagonByIndex(GetEntIndex(LUA, 1));
+	if (userdata)
+	{
+		HookRunTrainEnt(LUA, 1, true);
+		userdata->Finish();
+		while (userdata->ThreadRunning())
+		{
+			std::this_thread::sleep_for(std::chrono::microseconds(500));
+		}
+
+		delete userdata;
+	}
+	
+	return 0;
+}
+
+// добавить систему в очередь загрузки поезда
+LUA_FUNCTION( API_LoadSystem ) 
+{
+	const char* basename = LUA->GetString(1);
+	const char* name = LUA->GetString(2);
+	if (!basename || !name)
+		return 0;
+
+	g_LoadSystemList.emplace(name, basename);
+	return 0;
+}
+
+// регистрация класса системы поезда
+LUA_FUNCTION( API_RegisterSystem ) 
+{
+	const char* name = LUA->GetString(1);
+	const char* filename = LUA->GetString(2);
+	if (!name || !filename)
+		return 0;
+	
+	g_MetrostroiSystemList.emplace_back(name, filename);
+	ConColorMsg(Color(255, 0, 255, 255), "Turbostroi: Registering system %s [%s]\n", name, filename);
+	return 0;
+}
+
+// передача вызова TriggerInput от игрока в систему вагона в турбострое
+LUA_FUNCTION( API_TriggerInput )
+{
+	if (!LUA->IsType(1, GM::Type::Entity) ||
+		!LUA->IsType(2, GM::Type::String) ||
+		!LUA->IsType(3, GM::Type::String))
+		return 0;
+
+	CWagon* userdata = CWagon::CWagonByIndex(GetEntIndex(LUA, 1));
+	if (userdata == nullptr)
+		return 0;
+
+	const char* system_name = LUA->GetString(2);
+	const char* name = LUA->GetString(3);
+	double value;
+
+	if (LUA->IsType(4, GM::Type::Number))
+		value = LUA->GetNumber(4);
+	else if (LUA->IsType(4, GM::Type::Bool))
+		value = LUA->GetBool(4);
+	else
+		value = 0;
+
+	userdata->SimSendMessage(3, system_name, name, 0, value);
+
+	return 0;
+}
+
+// отправка сообщения из gmod в поток симуляции вагона
+LUA_FUNCTION( API_SendMessage ) 
+{
+	CWagon* userdata = CWagon::CWagonByIndex(GetEntIndex(LUA, 1));
+	if (userdata == nullptr)
+	{
+		LUA->PushBool(false);
+		return 1;
+	}
+
+	int message = (int)LUA->CheckNumber(2);
+	const char* system_name = LUA->CheckString(3);
+	const char* name = LUA->CheckString(4);
+	double index = LUA->CheckNumber(5);
+	double value = LUA->CheckNumber(6);
+
+	bool sended = userdata->SimSendMessage(message,
+		system_name,name,
+		index,value);
+
+	LUA->PushBool(sended);
+	return 1;
+}
+
+// пакетное вычитывание всех накопившихся сообщений от вагона в lua-таблицу
+LUA_FUNCTION( API_RecvMessages ) 
+{
+	CWagon* userdata = CWagon::CWagonByIndex(GetEntIndex(LUA, 1));
+	if (userdata == nullptr)
+		return 0;
+
+	int msg_count = userdata->SimReadAvailable();
+
+	if (msg_count == 0)
+		return 0;
+
+	lua_State* L = LUA->GetState();
+	GM::ILuaInterface* iLUA = reinterpret_cast<GM::ILuaInterface*>(LUA);
+	iLUA->PreCreateTable(msg_count+1, 0);
+	{
+		for (int i = 1; i <= msg_count; i++)
+		{
+			const TThreadMsg& tmsg = userdata->SimRecvMessage();
+			iLUA->PreCreateTable(5+1, 0);
+			{
+				LUA->PushNumber(tmsg.message);
+				GM::lua_rawseti(L, -2, 1);
+
+				LUA->PushString(tmsg.system_name);
+				GM::lua_rawseti(L, -2, 2);
+
+				LUA->PushString(tmsg.name);
+				GM::lua_rawseti(L, -2, 3);
+
+				LUA->PushNumber(tmsg.index);
+				GM::lua_rawseti(L, -2, 4);
+
+				LUA->PushNumber(tmsg.value);
+				GM::lua_rawseti(L, -2, 5);
+			}
+			GM::lua_rawseti(L, -2, i);
+		}
+	}
+	
+	return 1;
+}
+
+// вычитывание одного сообщения от вагона
+LUA_FUNCTION( API_RecvMessage ) 
+{
+	CWagon* userdata = CWagon::CWagonByIndex(GetEntIndex(LUA, 1));
+	if (userdata == nullptr)
+		return 0;
+
+	TThreadMsg& tmsg = userdata->SimRecvMessage();
+	LUA->PushNumber(tmsg.message);
+	LUA->PushString(tmsg.system_name);
+	LUA->PushString(tmsg.name);
+	LUA->PushNumber(tmsg.index);
+	LUA->PushNumber(tmsg.value);
+	return 5;
+}
+
+// выполнение произвольного кода через metrostroi_turbostroi_run
+LUA_FUNCTION( API_RunString )
+{
+	if (!g_RunStringEnabled)
+		return 0;
+
+	CWagon* userdata = CWagon::CWagonByIndex(GetEntIndex(LUA, 1));
+	if (userdata == nullptr)
+		return 0;
+
+	const char* str = LUA->CheckString(2);
+	int uid = (int)LUA->CheckNumber(3);
+	userdata->RunString(str, uid);
+	return 0;
+}
+
+// проверка количества доступных для чтения сообщений
+LUA_FUNCTION( API_ReadAvailable )
+{
+	CWagon* userdata = CWagon::CWagonByIndex(GetEntIndex(LUA, 1));
+
+	if (userdata != nullptr)
+		LUA->PushNumber(userdata->SimReadAvailable());
+	else
+		LUA->PushNumber(0);
+
+	return 1;
+}
+
+// настройка частоты тикрейта симуляции поездов в турбострое
+LUA_FUNCTION( API_SetSimulationFPS ) 
+{
+	double FPS = LUA->CheckNumber(1);
+	if (FPS == 0)
+		return 0;
+
+	g_ThreadTickrate = (unsigned int)(1000000.0 / FPS);
+	ConColorMsg(Color(0, 255, 0, 255), "Turbostroi: Changed to %d FPS (%.02f ms delay)\n", (int)(FPS + 0.5), g_ThreadTickrate / 1000.0f);
+	return 0;
+}
+
+// функции сохранены для обратной совместимости со старыми скриптами
+LUA_FUNCTION( API_SetMTAffinityMask )
+{
+	return 0;
+}
+
+LUA_FUNCTION( API_SetSTAffinityMask ) 
+{
+	return 0;
+}
+
+LUA_FUNCTION( API_StartRailNetwork ) 
+{
+	return 0;
+}
+
+//------------------------------------------------------------------------------
+// обработчик хука Think для синхронизации времени с движком
+//------------------------------------------------------------------------------
+LUA_FUNCTION_DECLARE( Think_handler )
+{
+	// забираем curtime напрямую из CGlobalVarsBase движка source
+	double curTime = *(double*)((char*)g_pServerGlobalVars + 12);
+	g_CurrentTime.store(curTime, std::memory_order_relaxed);
+	g_SharedPrint.PrintAvailable();
+	return 0;
+}
+
+// дергаем gmod-хуки создания/удаления вагона в lua
+void HookRunTrainEnt(GM::ILuaBase* LUA, int entStackPos, bool remove)
+{
+	if (LUA == nullptr)
+		return;
+
+	int top = LUA->Top();
+	LUA->PushSpecial(GM::SPECIAL_GLOB);
+	{
+		LUA->GetField(-1, "hook");
+		if (LUA->IsType(-1, GM::Type::Table))
+		{
+			LUA->GetField(-1, "Run");
+			if (LUA->IsType(-1, GM::Type::Function))
+			{
+				LUA->PushString(remove ? "TurbostroiWagonRemove" : "TurbostroiWagonCreate");
+				LUA->Push(entStackPos);
+				LUA->Call(2, 0);
+			}
+		}
+	}
+
+	LUA->Pop(LUA->Top() - top);
+}
+
+// регистрируем серверный Think хук для синхронизации времени
+void InstallHooks(GM::ILuaBase* LUA)
+{
+	ConColorMsg(Color(255, 0, 255, 255), "Turbostroi: Installing hooks!\n");
+
+	int top = LUA->Top();
+	LUA->PushSpecial(GM::SPECIAL_GLOB);
+	{
+		LUA->GetField(-1, "hook");
+		if (LUA->IsType(-1, GM::Type::Table))
+		{
+			LUA->GetField(-1, "Add");
+			if (LUA->IsType(-1, GM::Type::Function))
+			{
+				LUA->PushString("Think");
+				LUA->PushString("Turbostroi_TargetTimeSync");
+				LUA->PushCFunction(Think_handler);
+				LUA->Call(3, 0);
+			}
+		}
+	}
+		
+	LUA->Pop(LUA->Top() - top);
+}
+
+//------------------------------------------------------------------------------
+// инициализация бинарного модуля при require("turbostroi")
+//------------------------------------------------------------------------------
+GMOD_MODULE_OPEN()
+{
+	g_LibraryFileName = LUA->GetString(1);
+	LUA->Pop(1); // имя библиотеки
+	
+	if (!InitSourceSDK())
+		return 0;
+
+	LUA->PushSpecial(GM::SPECIAL_GLOB);
+	{
+		// модуль разрешено запускать строго на стороне сервера
+		LUA->GetField(-1, "SERVER");
+		if (LUA->IsType(-1, GM::Type::Nil))
+		{
+			ConColorMsg(Color(255, 0, 0, 255), "Turbostroi: DLL failed to initialize (gm_turbostroi.dll can only be used on server)\n");
+			return 0;
+		}
+		LUA->Pop();
+
+		// проверяем наличие аддона metrostroi
+		LUA->GetField(-1, "Metrostroi");
+		if (LUA->IsType(-1, GM::Type::Nil))
+		{
+			ConColorMsg(Color(255, 0, 0, 255), "Turbostroi: DLL failed to initialize (cannot be used standalone without metrostroi addon)\n");
+			return 0;
+		}
+		LUA->Pop();
+
+		InstallHooks(LUA);
+
+		// экспортируем c++ функции в глобальную таблицу Turbostroi
+		LUA->PushNumber(TURBOSTROI_VERSION); LUA->SetField(-2, "TURBOSTROI_VERSION");
+		LUA->CreateTable();
+		{
+			PushCFunc(API_InitializeTrain, "InitializeTrain");
+			PushCFunc(API_DeinitializeTrain, "DeinitializeTrain");
+			PushCFunc(API_StartRailNetwork, "StartRailNetwork");
+
+			PushCFunc(API_ReadAvailable, "ReadAvailable");
+			PushCFunc(API_SendMessage, "SendMessage");
+			PushCFunc(API_RecvMessages, "RecvMessages");
+			PushCFunc(API_RecvMessage, "RecvMessage");
+			PushCFunc(API_RunString, "RunString");
+
+			PushCFunc(API_LoadSystem, "LoadSystem");
+			PushCFunc(API_RegisterSystem, "RegisterSystem");
+			PushCFunc(API_TriggerInput, "TriggerInput");
+
+			PushCFunc(API_SetSimulationFPS, "SetSimulationFPS");
+			PushCFunc(API_SetMTAffinityMask, "SetMTAffinityMask");
+			PushCFunc(API_SetSTAffinityMask, "SetSTAffinityMask");
+		}
+		LUA->SetField(-2, "Turbostroi");
+
+		// подгружаем сопутствующий скрипт lib_turbostroi_v2.lua
+		LUA->GetField(-1, "include");
+		if (LUA->IsType(-1, GM::Type::Function))
+		{
+			LUA->PushString("metrostroi/lib_turbostroi_v2.lua");
+			LUA->Call(1, 0);
+		}
+	}
+	LUA->Pop();
+
+	// печатаем сводку в консоль сервера
+	ConColorMsg(Color(255, 0, 255, 255), "Turbostroi: [" TURBOSTROI_VERSION_PRINT "] DLL initialized (built " __DATE__ ")\n");
+	ConColorMsg(Color(255, 0, 255, 255), "Turbostroi: Running with %i cores\n", g_ProcessorCount);
+
+	if (!g_CurrentTime.is_lock_free())
+		ConColorMsg(Color(255, 255, 0, 255), "Turbostroi: Not fully supported! Perfomance may be decreased.\n");
+
+	return 0;
+}
+
+//------------------------------------------------------------------------------
+// выгрузка модуля при остановке сервера или смене карты
+//------------------------------------------------------------------------------
+GMOD_MODULE_CLOSE()
+{
+	g_ForceThreadsFinished = true;
+
+	ShutdownSourceSDK();
+
+	LUA->PushSpecial(GM::SPECIAL_GLOB);
+		LUA->GetField(-1, "Metrostroi");
+			if (LUA->IsType(-1, GM::Type::Table)) {
+				LUA->CreateTable();
+				LUA->SetField(-2, "TurbostroiRegistered");
+			}
+		LUA->Pop();
+		LUA->GetField(-1, "hook");
+			LUA->GetField(-1, "Remove");
+				LUA->PushString("Think");
+				LUA->PushString("Turbostroi_TargetTimeSync");
+				LUA->Call(2, 0);
+	LUA->Pop(2);
+	
+	LUA->PushNil();
+	LUA->SetField(GM::INDEX_GLOBAL, "Turbostroi");
+
+	ConColorMsg(Color(255, 0, 255, 255), "Turbostroi: DLL unloaded.\n");
+	return 0;
+}

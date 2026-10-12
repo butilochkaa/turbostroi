@@ -1,0 +1,12 @@
+[submodule "external/garrysmod_common"]
+	path = external/garrysmod_common
+	url = https://github.com/danielga/garrysmod_common.git
+[submodule "external/luajit"]
+	path = external/luajit
+	url = https://github.com/LuaJIT/LuaJIT.git
+[submodule "external/boost/config"]
+	path = external/boost/config
+	url = https://github.com/boostorg/config.git
+[submodule "external/boost/multiprecision"]
+	path = external/boost/multiprecision
+	url = https://github.com/boostorg/multiprecision.git

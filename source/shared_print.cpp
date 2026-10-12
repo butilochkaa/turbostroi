@@ -1,0 +1,92 @@
+#include "shared_print.h"
+#include <src/lua.hpp>
+#include <color.h>
+#include <dbg.h>
+
+// добавление строки в очередь вывода
+void SharedPrint::Push(std::string& str)
+{
+	m_Mutex.lock();
+	m_Queue.push(str);
+	m_Mutex.unlock();
+}
+
+void SharedPrint::Push(const char* str)
+{
+	std::string sstr(str);
+	Push(sstr);
+}
+
+// печать одного сообщения из очереди в консоль gmod
+void SharedPrint::PrintAvailable()
+{
+	m_Mutex.lock();
+	if (!m_Queue.empty())
+	{
+        std::string msg;
+        if (m_Queue.pop(msg))
+		    ConColorMsg(Color(255, 0, 255, 255), "%s", msg.c_str());
+	}
+	m_Mutex.unlock();
+}
+
+// очистка очереди сообщений
+void SharedPrint::ClearPrintQueue()
+{
+	m_Mutex.lock();
+	while (!m_Queue.empty()) m_Queue.pop();
+	m_Mutex.unlock();
+}
+
+// аналог luaL_tolstring из исходников lua 5.4 для корректного tostring
+static const char* lj_tolstring(lua_State* L, int idx, size_t* len)
+{
+    if (luaL_callmeta(L, idx, "__tostring")) {
+        if (!lua_isstring(L, -1))
+            luaL_error(L, "'__tostring' must return a string");
+    }
+    else {
+        switch (lua_type(L, idx)) {
+        case LUA_TNUMBER:
+            lua_pushfstring(L, "%f", lua_tonumber(L, idx));
+            break;
+        case LUA_TSTRING:
+            lua_pushvalue(L, idx);
+            break;
+        case LUA_TBOOLEAN:
+            lua_pushstring(L, (lua_toboolean(L, idx) ? "true" : "false"));
+            break;
+        case LUA_TNIL:
+            lua_pushliteral(L, "nil");
+            break;
+        default: {
+            int tt = luaL_getmetafield(L, idx, "__name");
+            const char* kind = (tt == LUA_TSTRING) ? lua_tostring(L, -1) : luaL_typename(L, idx);
+            lua_pushfstring(L, "%s: %p", kind, lua_topointer(L, idx));
+            if (tt != LUA_TNIL)
+                lua_remove(L, -2);
+            break;
+        }
+        }
+    }
+    return lua_tolstring(L, -1, len);
+}
+
+// реализация функции print() внутри виртуальной машины вагона
+int SharedPrint::PrintL(lua_State* L)
+{
+    std::string msg;
+    int n = lua_gettop(L);
+    for (int i = 1; i <= n; i++) {
+        if (i > 1)
+            msg += '\t';
+
+        msg += lj_tolstring(L, i, nullptr);
+    }
+    msg += '\n';
+    g_SharedPrint.Push(msg);
+    return 0;
+}
+
+// синглтон очереди печати
+SharedPrint g_SharedPrint;
